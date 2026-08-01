@@ -1,94 +1,86 @@
-# MCU I/O Board Firmware (STM32G473 — Arduino + FreeRTOS)
+# mcu-io-firmware — Motor + Sensor Safety Demo
 
-The firmware that runs on the OOMWOO [I/O board](https://github.com/makerspet/oomwoo-io-board)
-MCU. In OOMWOO's CPU/MCU split ([ARCHITECTURE.md §5.4](../../docs/ARCHITECTURE.md)),
-the *CPU* (CM4/CM5-class module) runs ROS2/Nav2/SLAM, and the *MCU* on the I/O
-board owns *motors, encoders, sensors, battery charging, and hard safety*. This
-module is that MCU firmware. Its defining constraint: *safety must never depend on
-Linux/ROS2* — and, per the architecture below, it must never depend on the friendly
-Arduino layer either.
+## Why this module first
 
-The full design lives in the firmware repo — this RFC is the request for
-contribution and the acceptance bar.
+Out of everything on the oomwoo RFC list, this is the one I picked deliberately, not just because it was "ready to start work."
 
-> *Status — ready to start work.* The repo exists but has *no code yet*. Build it
-> on a *Nucleo-G474* dev board now; move to the real board when it's fabbed. Say so
-> in the [discussions](https://github.com/makerspet/oomwoo/discussions) so we can
-> coordinate.
+A robot vacuum spends its entire life moving around a house full of people, pets, furniture, and stairs. Every other feature — mapping, cleaning modes, scheduling, the app — only matters if the robot doesn't crash into things or hurt someone while doing it. The MCU firmware is where that protection actually lives: it's the layer sitting directly between the software's intentions and the motors physically moving. If this layer isn't solid, nothing built on top of it can be trusted.
 
-# Important References
+So before touching navigation, mapping, or any of the higher-level modules, I wanted to prove out the most safety-critical piece first: **can the firmware reliably detect an obstacle and cut motor power in real time, without depending on anything else in the stack?**
 
-- *Firmware repo + full spec* — [makerspet/oomwoo-io-firmware](https://github.com/makerspet/oomwoo-io-firmware).
-  The repo README is the detailed architecture, peripheral map, and milestones; read it first.
-- *Board spec (authoritative)* — [oomwoo-io-board SPEC.md](https://github.com/makerspet/oomwoo-io-board/blob/main/docs/SPEC.md)
-  — the motors, sensors, charging, and GPIO budget the firmware must serve (work in
-  progress; note its open TODOs, e.g. the GPIO 36/46 bumper-label question).
-- *CPU ↔ MCU serial contract* — [io-board-interface RFC](../io-board-interface) —
-  the custom serial framing, command/telemetry set, and health/watchdog handshake.
-- *System architecture* — [ARCHITECTURE.md §5.4](../../docs/ARCHITECTURE.md) — the CPU/MCU split and safety rationale.
-- *Simulated MCU link* — the [oomwoo-install](https://github.com/makerspet/oomwoo-install)
-  serial stub lets the CPU side be developed/tested before the board exists.
-- [STM32duino](https://github.com/stm32duino/Arduino_Core_STM32) · [STM32FreeRTOS](https://github.com/stm32duino/STM32FreeRTOS)
-- [Project discussions](https://github.com/makerspet/oomwoo/discussions?discussions_q=) · [Discord](https://discord.gg/3y2JKz5T25)
+This repo is that proof, built small and honest — one motor driver, two motors, one sensor, on a breadboard, not the full robot.
 
-# The architecture, in one rule
+## What it does
 
-Arduino-*or*-real-time-safety is a false choice; we get both by *layering*, so the
-layer a contributor touches is not the layer that keeps the robot safe:
+- Two DC motors run continuously, simulating the drive wheels
+- An ultrasonic sensor continuously watches for obstacles in front of the robot
+- The moment something gets within range, the motors are force-stopped — immediately, not on the next loop cycle
+- An LED lights up as a visual indicator whenever the safety system has taken over
+- A serial interface lets you send commands (`START`, `STOP`, `STATUS`) from a laptop, standing in for where the main robot computer will eventually talk to this board over the "custom serial to CPU" link mentioned in the spec
 
-- *Layer 3 — Arduino (STM32duino) API:* the contributor-friendly surface where new
-  behaviours, features, and peripheral bring-up happen.
-- *Layer 2 — FreeRTOS tasks* (static allocation): comms, control, telemetry,
-  charging, and safety supervisors; watchdog-fed, bounded reaction times.
-- *Layer 1 — HAL/timer-ISR real-time core:* motor control, the hard-safety cutoffs,
-  and the CPU watchdog. Maintainer-owned, safety-reviewed.
+## Why FreeRTOS
 
-*The rule:* the safety and motor-control core is *structurally isolated* from the
-Arduino layer — a bug or infinite loop in a contributor's sketch *cannot* defeat a
-cliff-stop, an overcurrent cutoff, or the CPU watchdog, because those live in
-interrupts and a hardware watchdog the upper layers can't starve.
+The oomwoo spec calls for FreeRTOS specifically because a vacuum's firmware has to do several things *at once*, reliably: drive the motors, read the sensor, and be ready to override everything the instant there's danger. A normal single-threaded loop can't guarantee that — if one part is busy, the safety check waits too, and "the safety check waited" is exactly the failure mode you can't afford in a moving robot.
 
-# Request for Contribution — Instructions
+So this demo runs three independent FreeRTOS tasks:
 
-Phased bring-up (details and the peripheral map are in the firmware repo README):
+- **Motor task** — decides whether to drive or stop, based on shared state
+- **Sensor task** — polls the ultrasonic sensor on its own schedule, independent of everything else
+- **Safety task** — the highest-priority task in the system. It has one job: watch the sensor data and force an obstacle flag the moment something gets too close. The motor task always checks this flag first, before anything else.
 
-- *Blink + SWD + serial echo* on a G473 dev board.
-- *CPU serial link* — implement the [io-board-interface](../io-board-interface)
-  framing + health/watchdog handshake; loopback tests green.
-- *One drive motor, closed loop* — H-bridge PWM + encoder capture + velocity PID in
-  the real-time core (the pattern every other motor follows).
-- *All actuators* — suction fan (BLDC + FG), main/side brush, LiDAR spin, water
-  pump, mop motors/servos — each with current sense.
-- *All sensors* — cliff / dock / side-proximity IR (ADC), bumpers, wheel-drop, IMU
-  (SPI), current channels.
-- *Safety layer* — ISR-level cliff/bumper/wheel-drop stop, per-motor overcurrent
-  limiting, IWDG, CPU watchdog/reset; *measure and document* each cutoff's
-  worst-case reaction time; include a hazard note.
-- *Charging supervisor* — power-path charger control, 0.5C cap, input DPM, graceful
-  "insufficient charger" handling.
-- *Integration* — run end-to-end against the CPU (or the simulated MCU serial tool).
-- Contribute in the firmware repo; announce progress in [Project Discussions](https://github.com/makerspet/oomwoo/discussions?discussions_q=).
-- iterate with review
-- TBD, expect the RFC to evolve
+This mirrors what the real firmware will eventually need at a much larger scale — more sensors, more safety conditions, more communication with the main computer — but the core pattern (independent tasks + safety having final say) is already proven here.
 
-*Safety-critical code requires maintainer safety review before merge* (over-current,
-thermal, short, mechanical pinch — include a hazard note).
+## Hardware used
 
-## Acceptance criteria
+| Component | Role |
+|---|---|
+| ESP32 DevKit-C (WROOM-32) | Runs the firmware — prototyping on ESP32 first since it's easy to source/flash; plan is to port to STM32G473 / Nucleo-G474RE to match the spec exactly |
+| L298N motor driver | Drives the two motors from the ESP32's low-current logic pins |
+| 2x TT gear motors | Stand-in for the drive wheels |
+| 4xAA battery pack | Separate power supply for the motors, isolated from ESP32's USB power |
+| HC-SR04 ultrasonic sensor | Obstacle detection — this is the safety input |
+| LED + 220Ω resistor | Visual indicator when safety stop is active |
+| 1kΩ + 2kΩ resistors | Voltage divider on the sensor's ECHO line — HC-SR04 outputs 5V, ESP32 GPIO is only rated for 3.3V, so this brings it down safely |
 
-Objective, measurable. Examples:
-- *Deterministic real-time core* — measured, documented worst-case reaction time for
-  each safety cutoff.
-- *Safety is layer-independent* — a deliberately hung Arduino-level task must *not*
-  defeat a cliff-stop, overcurrent cutoff, or the CPU watchdog; demonstrate it.
-- *Implements the [io-board-interface](../io-board-interface) serial contract* —
-  loopback + integration tested.
-- *Every actuator and sensor exercised* on the bench, documented, reproducible by
-  someone else.
-- *Charging behaves per spec* — 0.5C cap held; graceful degradation on a weak charger.
-- *Safety-critical code passed maintainer safety review* with a hazard note.
-- TBD, expect criteria to evolve.
+*(Note: ENA/ENB are currently set via jumper caps on the L298N, running the motors at fixed full power. PWM-based variable speed control is a planned next step — it doesn't change the safety architecture, just adds finer motor control on top of it.)*
 
-The maintainer selects among compliant candidates using these criteria. Multiple
-attempts are welcome and useful even if not selected — a non-selected design is
-still a valid learning exercise and a fallback.
+## Photos
+
+**The full setup:**
+![Full build](./images/full-setup.jpg)
+
+**ESP32 wiring:**
+![ESP32 wiring](./images/esp32-wiring.jpg)
+
+**L298N + motors:**
+![Motor driver](./images/l298n-motors.jpg)
+
+**HC-SR04 sensor:**
+![Sensor](./images/sensor.jpg)
+
+## Demo video
+
+[Link to demo video] — shows the motors running, an obstacle being introduced in front of the sensor, the motors cutting off instantly, the LED lighting up, and the motors resuming once the obstacle is cleared. Serial monitor is visible throughout, showing live status.
+
+## Serial commands
+
+Connect at 115200 baud.
+
+| Command | Effect |
+|---|---|
+| `START` | Resume motor operation (if not blocked by an obstacle) |
+| `STOP` | Force motors off, regardless of sensor state |
+| `STATUS` | Print current motor state, sensor distance, and safety status |
+
+Status also prints automatically once per second, without needing a command — useful for watching behavior live during testing.
+
+## What's next
+
+- PWM-based variable speed control on ENA/ENB, instead of the current fixed-speed jumper cap setup
+- Port to STM32G473 / Nucleo-G474RE to match the spec's target chip
+- Define the actual serial protocol contract with whatever will run on the CPU side (ROS2 bridge)
+- Expand from one sensor to the fuller safety picture the real robot will need (multiple sensors, bumper input, etc.)
+
+## Discussion
+
+Continuing the conversation from [Discussion #49](https://github.com/makerspet/oomwoo/discussions/49) — feedback on the task structure or serial protocol design is welcome before this goes further.
